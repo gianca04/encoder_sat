@@ -1,0 +1,15 @@
+# Entorno
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Datos y Modelos (opcional, pero recomendado ignorar archivos grandes)
+# datos/*.csv
+# modelos/*.keras
+# modelos/*.joblib
