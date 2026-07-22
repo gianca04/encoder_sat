@@ -183,48 +183,86 @@ def extraer_datos_historicos(inicio_str, fin_str=None, verbose=False):
     return df_consolidado
 
 
-def preprocesar_datos(df_crudo):
-    """Limpia y normaliza datos cargados en memoria."""
+def preprocesar_datos(df_crudo, max_gap_segundos=180):
+    """
+    Limpia y normaliza datos cargados en memoria.
+    Maneja adecuadamente tiempos muertos y paradas prolongadas (gaps de días/meses)
+    interpolando solo DENTRO de sub-bloques continuos de tiempo.
+    """
     print("\n" + "=" * 60)
-    print("  PASO 3: Preprocesamiento y normalización")
+    print("  PASO 3: Preprocesamiento y normalización (Manejo de Gaps Temporales)")
     print("=" * 60)
     
-    df = df_crudo.set_index("timestamp").copy()
-    df = df[COLUMNAS_FEATURES]
-    
+    df = df_crudo.copy()
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        df = df.sort_index()
+        df["timestamp"] = pd.to_datetime(df.index)
+        df = df.reset_index(drop=True)
+
+    # Identificar vacíos de datos (Gaps > max_gap_segundos)
+    df["delta_time"] = df["timestamp"].diff().dt.total_seconds()
+    df["bloque_id"] = (df["delta_time"] > max_gap_segundos).cumsum()
+
     col_motor = "MOTOR_01_Running"
-    cols_continuas = [c for c in df.columns if c != col_motor]
-    
-    # Imputar continuas e imputar motor
-    for col in cols_continuas:
-        df[col] = df[col].interpolate(method="linear").ffill().bfill()
+    cols_features = [c for c in COLUMNAS_FEATURES if c in df.columns]
+    cols_continuas = [c for c in cols_features if c != col_motor]
+
+    dfs_limpios = []
+    n_bloques = df["bloque_id"].nunique()
+    print(f"  [INFO] Se detectaron {n_bloques:,} bloque(s) continuos de datos (gaps > {max_gap_segundos}s).")
+
+    for bloque_id, df_bloque in df.groupby("bloque_id"):
+        if len(df_bloque) < 5:
+            continue  # Descartar fragmentos ruidosos demasiado pequeños
+            
+        df_b = df_bloque.set_index("timestamp")[cols_features].copy()
         
-    if col_motor in df.columns:
-        df[col_motor] = df[col_motor].ffill().bfill()
-        
-    df = df.dropna()
+        # Interpolar únicamente DENTRO del bloque continuo
+        for col in cols_continuas:
+            df_b[col] = df_b[col].interpolate(method="linear", limit=5).ffill().bfill()
+            
+        if col_motor in df_b.columns:
+            df_b[col_motor] = df_b[col_motor].ffill().bfill()
+
+        dfs_limpios.append(df_b)
+
+    if not dfs_limpios:
+        raise ValueError("No se obtuvieron bloques de datos válidos para procesar.")
+
+    df_consolidado = pd.concat(dfs_limpios)
+
+    # Filtrar si la máquina estuvo apagada o motor en 0
+    if col_motor in df_consolidado.columns:
+        n_prev = len(df_consolidado)
+        df_consolidado = df_consolidado[df_consolidado[col_motor] == 1]
+        print(f"  [INFO] Filtrado por operación ({col_motor}==1): {len(df_consolidado):,} de {n_prev:,} muestras conservadas.")
+
+    df = df_consolidado.dropna()
     n_muestras = len(df)
-    
+
     if n_muestras < 100:
         raise ValueError(f"Muestras insuficientes para entrenar: {n_muestras}")
-        
-    print(f"  Total muestras limpias: {n_muestras:,}")
-    
-    # Split cronológico 80/20
+
+    print(f"  Total muestras limpias consolidadas: {n_muestras:,}")
+
+    # Split cronológico 80/20 sobre la data unificada operativa
     n_train = int(n_muestras * 0.8)
     df_train = df.iloc[:n_train].copy()
     df_test = df.iloc[n_train:].copy()
-    
+
     print(f"  Muestras de Entrenamiento (Train): {len(df_train):,} (80%)")
     print(f"  Muestras de Validación (Test):      {len(df_test):,} (20%)")
-    
+
     scaler = MinMaxScaler(feature_range=(0, 1))
     datos_train_norm = scaler.fit_transform(df_train.values)
     datos_test_norm = scaler.transform(df_test.values)
-    
+
     df_train_norm = pd.DataFrame(datos_train_norm, columns=df_train.columns, index=df_train.index)
     df_test_norm = pd.DataFrame(datos_test_norm, columns=df_test.columns, index=df_test.index)
-    
+
     # Guardar reporte histórico en disco
     try:
         ruta_csv = os.path.join(DATOS_DIR, "datos_sensores_ultimo_entrenamiento.csv")
@@ -232,7 +270,7 @@ def preprocesar_datos(df_crudo):
         print(f"  [OK] Dataset histórico guardado en: {ruta_csv}")
     except Exception as e:
         print(f"  [WARN] No se pudo guardar el CSV histórico: {e}")
-        
+
     return df_train_norm, df_test_norm, scaler
 
 

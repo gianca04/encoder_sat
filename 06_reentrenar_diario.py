@@ -202,41 +202,71 @@ def extraer_datos_historicos(inicio_str, verbose=False):
     return df_consolidado
 
 
-def preprocesar_datos_memoria(df_crudo):
+def preprocesar_datos_memoria(df_crudo, max_gap_segundos=180):
     """
     Preprocesa los datos crudos en memoria y genera datasets de train y test.
+    Maneja adecuadamente tiempos muertos y paradas prolongadas (gaps de días/meses)
+    interpolando solo DENTRO de sub-bloques continuos de tiempo.
     """
     print("\n" + "=" * 60)
-    print("  PASO 3: Preprocesamiento de datos en memoria")
+    print("  PASO 3: Preprocesamiento de datos en memoria (Manejo de Gaps Temporales)")
     print("=" * 60)
     
-    df = df_crudo.set_index("timestamp").copy()
-    
-    # Quedarse con las columnas de features correctas
-    df = df[COLUMNAS_FEATURES]
-    
-    # Manejo de NaNs
+    df = df_crudo.copy()
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        df = df.sort_index()
+        df["timestamp"] = pd.to_datetime(df.index)
+        df = df.reset_index(drop=True)
+
+    # Identificar vacíos de datos (Gaps > max_gap_segundos)
+    df["delta_time"] = df["timestamp"].diff().dt.total_seconds()
+    df["bloque_id"] = (df["delta_time"] > max_gap_segundos).cumsum()
+
     col_motor = "MOTOR_01_Running"
-    cols_continuas = [c for c in df.columns if c != col_motor]
-    
-    # Variables continuas -> interpolación lineal + bfill/ffill
-    for col in cols_continuas:
-        df[col] = df[col].interpolate(method="linear").ffill().bfill()
+    cols_features = [c for c in COLUMNAS_FEATURES if c in df.columns]
+    cols_continuas = [c for c in cols_features if c != col_motor]
+
+    dfs_limpios = []
+    n_bloques = df["bloque_id"].nunique()
+    print(f"  [INFO] Se detectaron {n_bloques:,} bloque(s) continuos de datos (gaps > {max_gap_segundos}s).")
+
+    for bloque_id, df_bloque in df.groupby("bloque_id"):
+        if len(df_bloque) < 5:
+            continue  # Descartar fragmentos ruidosos demasiado pequeños
+            
+        df_b = df_bloque.set_index("timestamp")[cols_features].copy()
         
-    # Variables binarias (motor) -> ffill + bfill
-    if col_motor in df.columns:
-        df[col_motor] = df[col_motor].ffill().bfill()
-        
-    # Eliminar filas que aún tengan NaNs
-    df = df.dropna()
-    
+        # Interpolar únicamente DENTRO del bloque continuo
+        for col in cols_continuas:
+            df_b[col] = df_b[col].interpolate(method="linear", limit=5).ffill().bfill()
+            
+        if col_motor in df_b.columns:
+            df_b[col_motor] = df_b[col_motor].ffill().bfill()
+
+        dfs_limpios.append(df_b)
+
+    if not dfs_limpios:
+        raise ValueError("No se obtuvieron bloques de datos válidos para procesar.")
+
+    df_consolidado = pd.concat(dfs_limpios)
+
+    # Filtrar si la máquina estuvo apagada o motor en 0
+    if col_motor in df_consolidado.columns:
+        n_prev = len(df_consolidado)
+        df_consolidado = df_consolidado[df_consolidado[col_motor] == 1]
+        print(f"  [INFO] Filtrado por operación ({col_motor}==1): {len(df_consolidado):,} de {n_prev:,} muestras conservadas.")
+
+    df = df_consolidado.dropna()
     n_total = len(df)
     if n_total < 500:
         raise ValueError(f"Datos insuficientes para entrenamiento seguro: {n_total} muestras.")
         
-    print(f"  Muestras limpias totales: {n_total:,}")
+    print(f"  Muestras limpias totales consolidadas: {n_total:,}")
     
-    # Split cronológico 80/20
+    # Split cronológico 80/20 sobre la data unificada operativa
     n_train = int(n_total * 0.8)
     df_train = df.iloc[:n_train].copy()
     df_test = df.iloc[n_train:].copy()

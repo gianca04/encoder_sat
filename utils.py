@@ -84,100 +84,67 @@ def crear_directorios():
 # FUNCIONES DE CONSULTA A PROMETHEUS / VICTORIAMETRICS
 # =============================================================================
 
-def consultar_prometheus(equipo, metrica, inicio, fin, step="15s"):
+def consultar_prometheus(equipo, metrica, inicio, fin, step="30s", chunk_days=5):
     """
     Consulta una serie temporal desde la API query_range de Prometheus/VictoriaMetrics.
-    
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  EXPLICACIÓN DEL PROCESO:                                         │
-    │                                                                   │
-    │  La API query_range permite obtener valores de una métrica en un  │
-    │  rango de tiempo definido. Cada consulta retorna pares            │
-    │  [timestamp, valor] que luego se convierten a DataFrame.          │
-    │                                                                   │
-    │  VictoriaMetrics es compatible con la API de Prometheus, por lo   │
-    │  que usamos el endpoint /api/v1/query_range estándar.             │
-    └─────────────────────────────────────────────────────────────────────┘
-    
-    Parámetros:
-    -----------
-    equipo : str
-        Nombre del equipo (ej: "FIT_001")
-    metrica : str
-        Nombre de la métrica (ej: "Flow")
-    inicio : datetime
-        Timestamp de inicio de la consulta
-    fin : datetime
-        Timestamp de fin de la consulta
-    step : str
-        Intervalo de muestreo (default: "15s")
-        
-    Retorna:
-    --------
-    pd.DataFrame
-        DataFrame con columnas ['timestamp', '<equipo>_<metrica>']
-        El timestamp está en formato datetime UTC.
+    Realiza fragmentación (chunking) automática en rangos de `chunk_days` días para evitar
+    errores de límites de puntos por serie (HTTP 422) en consultas extensas.
     """
-    # Construir la query PromQL
     query = f'lab_sat_valor{{equipo="{equipo}", metrica="{metrica}"}}'
-    
-    # Parámetros para la API query_range
-    params = {
-        "query": query,
-        "start": int(inicio.timestamp()),
-        "end":   int(fin.timestamp()),
-        "step":  step,
-    }
-    
     url = f"{PROMETHEUS_URL}/api/v1/query_range"
+    nombre_columna = f"{equipo}_{metrica}"
     
     print(f"  -> Consultando: {equipo}/{metrica} ...")
-    print(f"    URL: {url}")
-    print(f"    Query: {query}")
-    print(f"    Rango: {inicio} -> {fin} (step={step})")
+    print(f"    Rango total: {inicio} -> {fin} (step={step})")
     
-    try:
-        response = requests.get(url, params=params, timeout=60)
-        response.raise_for_status()
-        data = response.json()
+    dfs_chunks = []
+    curr_inicio = inicio
+    delta_chunk = timedelta(days=chunk_days)
+    
+    while curr_inicio < fin:
+        curr_fin = min(curr_inicio + delta_chunk, fin)
         
-        # Validar respuesta
-        if data.get("status") != "success":
-            print(f"    [ERROR] Status: {data.get('status')}")
-            print(f"    Error: {data.get('error', 'Desconocido')}")
+        params = {
+            "query": query,
+            "start": int(curr_inicio.timestamp()),
+            "end":   int(curr_fin.timestamp()),
+            "step":  step,
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("status") == "success":
+                results = data.get("data", {}).get("result", [])
+                if results:
+                    values = results[0].get("values", [])
+                    if values:
+                        df_sub = pd.DataFrame(values, columns=["timestamp", nombre_columna])
+                        df_sub["timestamp"] = pd.to_datetime(df_sub["timestamp"], unit="s", utc=True)
+                        df_sub[nombre_columna] = df_sub[nombre_columna].astype(float)
+                        dfs_chunks.append(df_sub)
+        except requests.exceptions.ConnectionError:
+            print(f"    [ERROR] No se pudo conectar a {PROMETHEUS_URL}")
             return pd.DataFrame()
+        except requests.exceptions.Timeout:
+            print(f"    [ERROR] Timeout al consultar {equipo}/{metrica} ({curr_inicio} a {curr_fin})")
+        except Exception as e:
+            print(f"    [WARN] Sub-consulta falló para {curr_inicio} -> {curr_fin}: {e}")
+            
+        curr_inicio = curr_fin
         
-        # Extraer los valores de la serie temporal
-        results = data.get("data", {}).get("result", [])
-        
-        if not results:
-            print(f"    [WARN] No se encontraron datos para {equipo}/{metrica}")
-            return pd.DataFrame()
-        
-        # Tomar la primera serie (debería ser la única)
-        values = results[0].get("values", [])
-        nombre_columna = f"{equipo}_{metrica}"
-        
-        # Convertir a DataFrame
-        df = pd.DataFrame(values, columns=["timestamp", nombre_columna])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-        df[nombre_columna] = df[nombre_columna].astype(float)
-        
-        print(f"    [OK] {len(df)} muestras obtenidas")
-        print(f"    Rango real: {df['timestamp'].min()} -> {df['timestamp'].max()}")
-        
-        return df
-        
-    except requests.exceptions.ConnectionError:
-        print(f"    [ERROR] No se pudo conectar a {PROMETHEUS_URL}")
-        print(f"    Verifica que VictoriaMetrics esté corriendo en esa dirección.")
+    if not dfs_chunks:
+        print(f"    [WARN] No se encontraron datos para {equipo}/{metrica}")
         return pd.DataFrame()
-    except requests.exceptions.Timeout:
-        print(f"    [ERROR] Timeout al consultar {equipo}/{metrica}")
-        return pd.DataFrame()
-    except Exception as e:
-        print(f"    [ERROR] Error inesperado: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        
+    df_final = pd.concat(dfs_chunks).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    print(f"    [OK] {len(df_final):,} muestras obtenidas en total")
+    if not df_final.empty:
+        print(f"    Rango real: {df_final['timestamp'].min()} -> {df_final['timestamp'].max()}")
+        
+    return df_final
 
 
 # =============================================================================
