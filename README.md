@@ -151,5 +151,64 @@ El estado general de la planta (`planta.estado_namur` y `planta.estado_code`) se
 1. **Salud General (`salud_pct`):** Se reporta como el valor mínimo de salud observado entre todos los sensores monitoreados.
 2. **Estado General (`estado_code` / `estado_namur`):** Se asigna el peor estado (código numérico más alto) de todos los sensores individuales. Si un solo sensor crítico entra en `CRITICAL`, toda la planta pasa automáticamente a estado `CRITICAL`.
 
+---
 
+## ⚙️ Registro como Servicio del Sistema (`systemd` Daemon)
 
+Para garantizar la ejecución continua 24/7 en producción y el reinicio automático ante reinicios del servidor o fallas de red, registra el detector como un servicio `systemd`.
+
+### 1. Crear el Archivo de Servicio
+Crea el archivo `/etc/systemd/system/sat-encoder.service`:
+
+```ini
+[Unit]
+Description=SAT Autoencoder Anomaly Detection Engine (MQTT)
+After=network.target network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/encoder_sat
+
+# Apuntar directamente al ejecutable Python del entorno virtual
+ExecStart=/root/encoder_sat/venv/bin/python /root/encoder_sat/detectar_mqtt.py
+
+# Envío de logs en tiempo real sin almacenamiento en búfer
+Environment=PYTHONUNBUFFERED=1
+
+# Reinicio automático continuo en producción
+Restart=always
+RestartSec=5s
+
+# Gestión de parada limpia
+KillMode=mixed
+TimeoutStopSec=10s
+
+# Logs centralizados con systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sat-encoder
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 2. Comandos de Gestión del Servicio
+
+```bash
+# Recargar systemd para registrar el servicio
+systemctl daemon-reload
+
+# Habilitar inicio automático en el arranque del servidor
+systemctl enable sat-encoder.service
+
+# Iniciar el servicio
+systemctl start sat-encoder.service
+
+# Verificar el estado operativo
+systemctl status sat-encoder.service
+
+# Ver logs en vivo (tiempo real)
+journalctl -u sat-encoder.service -f
+```
