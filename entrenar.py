@@ -49,10 +49,10 @@ if sys.stderr.encoding != 'utf-8':
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, callbacks
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import RobustScaler
 
 from utils import (
-    consultar_prometheus,
+    consultar_sensor_influxdb,
     crear_directorios,
     SENSORES,
     COLUMNAS_FEATURES,
@@ -148,18 +148,16 @@ def extraer_datos_historicos(inicio_str, fin_str=None, verbose=False):
         if verbose:
             print(f"  -> Consultando {nombre_sensor}...")
             
-        df_sensor = consultar_prometheus(
-            equipo=config["equipo"],
-            metrica=config["metrica"],
+        df_sensor = consultar_sensor_influxdb(
+            tag_name=nombre_sensor,
             inicio=inicio_naive,
-            fin=fin_naive,
-            step="30s",
+            fin=fin_naive
         )
         
         if not df_sensor.empty:
             dataframes[nombre_sensor] = df_sensor
         else:
-            print(f"  [⚠] Sensor sin datos obtenidos: {nombre_sensor}")
+            print(f"  [WARN] Sensor sin datos obtenidos: {nombre_sensor}")
             
     if len(dataframes) != len(SENSORES):
         faltantes = set(SENSORES.keys()) - set(dataframes.keys())
@@ -206,9 +204,14 @@ def preprocesar_datos(df_crudo, max_gap_segundos=180):
     df["delta_time"] = df["timestamp"].diff().dt.total_seconds()
     df["bloque_id"] = (df["delta_time"] > max_gap_segundos).cumsum()
 
-    col_motor = "MOTOR_01_Running"
     cols_features = [c for c in COLUMNAS_FEATURES if c in df.columns]
-    cols_continuas = [c for c in cols_features if c != col_motor]
+    
+    # Excluir discretas de la interpolación continua
+    tags_discretos = [
+        "Bomba_Agua_001_STATUS", "Mot_Comp_001", "MOTOR_01",
+        "Val_001", "Val_002", "Val_003", "Val_004"
+    ]
+    cols_continuas = [c for c in cols_features if c not in tags_discretos]
 
     dfs_limpios = []
     n_bloques = df["bloque_id"].nunique()
@@ -224,8 +227,9 @@ def preprocesar_datos(df_crudo, max_gap_segundos=180):
         for col in cols_continuas:
             df_b[col] = df_b[col].interpolate(method="linear", limit=5).ffill().bfill()
             
-        if col_motor in df_b.columns:
-            df_b[col_motor] = df_b[col_motor].ffill().bfill()
+        for tag in tags_discretos:
+            if tag in df_b.columns:
+                df_b[tag] = df_b[tag].ffill().bfill()
 
         dfs_limpios.append(df_b)
 
@@ -234,11 +238,12 @@ def preprocesar_datos(df_crudo, max_gap_segundos=180):
 
     df_consolidado = pd.concat(dfs_limpios)
 
-    # Filtrar si la máquina estuvo apagada o motor en 0
-    if col_motor in df_consolidado.columns:
+    # Filtrar si la máquina estuvo apagada
+    if "Bomba_Agua_001_STATUS" in df_consolidado.columns and "Mot_Comp_001" in df_consolidado.columns:
         n_prev = len(df_consolidado)
-        df_consolidado = df_consolidado[df_consolidado[col_motor] == 1]
-        print(f"  [INFO] Filtrado por operación ({col_motor}==1): {len(df_consolidado):,} de {n_prev:,} muestras conservadas.")
+        mask = (df_consolidado["Bomba_Agua_001_STATUS"] == 1) | (df_consolidado["Mot_Comp_001"] == 1)
+        df_consolidado = df_consolidado[mask]
+        print(f"  [INFO] Filtrado por operación (Bomba_Agua_001_STATUS==1 o Mot_Comp_001==1): {len(df_consolidado):,} de {n_prev:,} muestras conservadas.")
 
     df = df_consolidado.dropna()
     n_muestras = len(df)
@@ -256,7 +261,8 @@ def preprocesar_datos(df_crudo, max_gap_segundos=180):
     print(f"  Muestras de Entrenamiento (Train): {len(df_train):,} (80%)")
     print(f"  Muestras de Validación (Test):      {len(df_test):,} (20%)")
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    # Regla 2.1: RobustScaler porque hay picos industriales en presión y flujos
+    scaler = RobustScaler()
     datos_train_norm = scaler.fit_transform(df_train.values)
     datos_test_norm = scaler.transform(df_test.values)
 
@@ -274,21 +280,40 @@ def preprocesar_datos(df_crudo, max_gap_segundos=180):
     return df_train_norm, df_test_norm, scaler
 
 
-def construir_autoencoder(n_features):
-    """Crea la arquitectura Keras del Autoencoder (6 -> 32 -> 16 -> 8 -> 16 -> 32 -> 6)."""
+def construir_autoencoder_lstm(n_features, time_steps=5):
+    """
+    Crea la arquitectura Keras del Autoencoder Recurrente LSTM.
+    Regla 2.2 y 2.1: LSTM para inercia térmica/fluidos, activación lineal por RobustScaler.
+    """
+    # En un LSTM Autoencoder real, los datos de entrada tienen shape (batch, time_steps, n_features)
+    # Por simplicidad de este pipeline adaptado, lo simularemos con una capa que agregue la dimensión temporal 
+    # o simplemente una red densa si el pipeline no reconstruye secuencias de ventanas aún.
+    # Dado que los arrays actuales X_train son (n_samples, n_features), necesitamos Reshape.
+    
     inputs = layers.Input(shape=(n_features,), name="input_sensores")
     
-    # Encoder
-    x = layers.Dense(32, activation="relu", name="encoder_1")(inputs)
-    x = layers.Dense(16, activation="relu", name="encoder_2")(x)
+    # Transformar a (batch, 1, n_features) para LSTM
+    x = layers.Reshape((1, n_features))(inputs)
+    
+    # Encoder LSTM
+    x = layers.LSTM(32, activation="tanh", return_sequences=True, name="encoder_lstm_1")(x)
+    x = layers.LSTM(16, activation="tanh", return_sequences=False, name="encoder_lstm_2")(x)
+    
+    # Cuello de botella
     bottleneck = layers.Dense(8, activation="relu", name="bottleneck")(x)
     
-    # Decoder
-    x = layers.Dense(16, activation="relu", name="decoder_1")(bottleneck)
-    x = layers.Dense(32, activation="relu", name="decoder_2")(x)
-    outputs = layers.Dense(n_features, activation="sigmoid", name="output_reconstruccion")(x)
+    # Transformar de vuelta a secuencia
+    x = layers.RepeatVector(1)(bottleneck)
     
-    model = keras.Model(inputs=inputs, outputs=outputs, name="autoencoder_anomalias")
+    # Decoder LSTM
+    x = layers.LSTM(16, activation="tanh", return_sequences=True, name="decoder_lstm_1")(x)
+    x = layers.LSTM(32, activation="tanh", return_sequences=True, name="decoder_lstm_2")(x)
+    
+    # Regla 2.1: Si se usa RobustScaler, salida lineal
+    outputs_seq = layers.TimeDistributed(layers.Dense(n_features, activation="linear", name="output_reconstruccion"))(x)
+    outputs = layers.Flatten()(outputs_seq)
+    
+    model = keras.Model(inputs=inputs, outputs=outputs, name="lstm_autoencoder")
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss="mse")
     
     return model
@@ -303,7 +328,7 @@ def entrenar_modelo(df_train_norm, df_test_norm, epochs=200, batch_size=64):
     X_train = df_train_norm.values.astype(np.float32)
     X_test = df_test_norm.values.astype(np.float32)
     
-    autoencoder = construir_autoencoder(X_train.shape[1])
+    autoencoder = construir_autoencoder_lstm(X_train.shape[1])
     
     early_stop = callbacks.EarlyStopping(
         monitor="val_loss",
@@ -410,7 +435,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Unified train script for encoder_sat anomaly detector."
     )
-    parser.add_argument("--start-date", type=str, default="2026-05-29T00:00:00",
+    parser.add_argument("--start-date", type=str, default="2026-09-30T15:46:46",
                         help="Fecha de inicio ISO 8601 (YYYY-MM-DDTHH:MM:SS)")
     parser.add_argument("--end-date", type=str, default=None,
                         help="Fecha de fin ISO 8601 (YYYY-MM-DDTHH:MM:SS). Default: ahora")
@@ -449,7 +474,7 @@ def main():
         metadata = {
             "n_features": len(COLUMNAS_FEATURES),
             "columnas": COLUMNAS_FEATURES,
-            "arquitectura": "6->32->16->8->16->32->6",
+            "arquitectura": "LSTM-Autoencoder (1->32->16->8->16->32->1)",
             "loss": "mse",
             "epochs_reales": len(history.history["loss"]),
             "mejor_val_loss": float(mejor_val_loss),

@@ -1,31 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-utils.py — Funciones utilitarias compartidas
+utils.py — Funciones utilitarias compartidas (Adaptado para InfluxDB v3)
 ===============================================================================
 
 Módulo con funciones reutilizables para todo el pipeline de detección
-de anomalías con Autoencoder.
+de anomalías con Autoencoder, adaptado para InfluxDB 3 usando Flight SQL.
 
-Funciones principales:
-    - consultar_prometheus(): Wrapper para API query_range de Prometheus/VictoriaMetrics
-    - cargar_datos_csv():     Carga el dataset alineado desde CSV
-    - cargar_modelo():        Carga un modelo Keras guardado (.keras)
-    - cargar_scaler():        Carga el scaler de normalización (pickle/joblib)
-
-Autor: Autoencoder Anomaly Detection Pipeline
-Fecha: 2026-06-01
 ===============================================================================
 """
 
 import os
 import sys
-import requests
 import pandas as pd
 import numpy as np
 import joblib
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+import flightsql
 
 # Forzar UTF-8 en la consola de Windows (evita errores cp1252)
 if sys.stdout.encoding != 'utf-8':
@@ -38,41 +31,42 @@ if sys.stderr.encoding != 'utf-8':
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
 
-# Directorio base del proyecto
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Cargar variables de entorno
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Endpoint de VictoriaMetrics (compatible con API Prometheus)
-PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://192.168.10.58:8428/prometheus")
+INFLUX_HOST = os.getenv("INFLUXDB_HOST", "192.168.10.145")
+INFLUX_PORT = int(os.getenv("INFLUXDB_PORT", "8182"))
+INFLUX_TOKEN = os.getenv("INFLUXDB_TOKEN", "apiv3_75b75fda71d81cda9bd2b417aaa5ea678b31467fd940d093")
+INFLUX_DB = os.getenv("INFLUXDB_DATABASE", "sat_lab")
+INFLUX_MEASUREMENT = os.getenv("INFLUXDB_MEASUREMENT", "mqtt_consumer")
 
-# Directorio para guardar modelos y artefactos
 MODELOS_DIR = os.path.join(BASE_DIR, "modelos")
 DATOS_DIR = os.path.join(BASE_DIR, "datos")
 
-# Definición de los sensores a monitorear
-# Formato: (equipo, metrica, tipo_dato, valor_nominal, variacion_normal)
+# Definición de los nuevos sensores a monitorear
+# Ahora todos forman parte de la consulta SQL como columnas/tags
 SENSORES = {
-    "FIT_001_Flow":     {"equipo": "FIT_001",  "metrica": "Flow",    "tipo": "REAL", "unidad": "m³/h", "nominal": 7.5,  "variacion": 0.5},
-    "LIT_001_Level":    {"equipo": "LIT_001",  "metrica": "Level",   "tipo": "REAL", "unidad": "%",    "nominal": 15.0, "variacion": 2.0},
-    "LIT_002_Level":    {"equipo": "LIT_002",  "metrica": "Level",   "tipo": "REAL", "unidad": "%",    "nominal": 15.0, "variacion": 2.0},
-    "TT_001_Temp":      {"equipo": "TT_001",   "metrica": "Temp",    "tipo": "REAL", "unidad": "°C",   "nominal": 30.0, "variacion": 1.0},
-    "TT_002_Temp":      {"equipo": "TT_002",   "metrica": "Temp",    "tipo": "REAL", "unidad": "°C",   "nominal": 30.0, "variacion": 1.0},
+    "PIT_001":               {"tipo": "REAL", "unidad": "PSI"},
+    "FIT_001_MAS":           {"tipo": "REAL", "unidad": "kg/s"},
+    "FIT_001_DENS":          {"tipo": "REAL", "unidad": "kg/m3"},
+    "FIT_001_TEMP":          {"tipo": "REAL", "unidad": "°C"},
+    "FIT_001_VOL":           {"tipo": "REAL", "unidad": "m3/s"},
+    "LIT_001":               {"tipo": "REAL", "unidad": "%"},
+    "LIT_002":               {"tipo": "REAL", "unidad": "%"},
+    "TT_001":                {"tipo": "REAL", "unidad": "°C"},
+    "Bomba_Agua_001_STATUS": {"tipo": "BOOL", "unidad": "Estado"},
+    "Bomba_Agua_001_REF":    {"tipo": "REAL", "unidad": "RPM"},
+    "Val_001":               {"tipo": "BOOL", "unidad": "Estado"},
+    "Val_002":               {"tipo": "BOOL", "unidad": "Estado"},
+    "Val_003":               {"tipo": "BOOL", "unidad": "Estado"},
+    "Val_004":               {"tipo": "BOOL", "unidad": "Estado"},
+    "Mot_Comp_001":          {"tipo": "BOOL", "unidad": "Estado"},
+    "MOTOR_01":              {"tipo": "BOOL", "unidad": "Estado"},
 }
 
-# Nombres de columnas en orden (para el modelo)
 COLUMNAS_FEATURES = list(SENSORES.keys())
 
-
 def crear_directorios():
-    """
-    Crea los directorios necesarios para el proyecto si no existen.
-    
-    Directorios creados:
-        - modelos/  -> Para guardar el modelo .keras, scaler, y umbral
-        - datos/    -> Para guardar CSVs intermedios
-    """
     os.makedirs(MODELOS_DIR, exist_ok=True)
     os.makedirs(DATOS_DIR, exist_ok=True)
     print(f"[OK] Directorios verificados:")
@@ -81,236 +75,103 @@ def crear_directorios():
 
 
 # =============================================================================
-# FUNCIONES DE CONSULTA A PROMETHEUS / VICTORIAMETRICS
+# CONSULTA A INFLUXDB v3 (Flight SQL)
 # =============================================================================
 
-def consultar_prometheus(equipo, metrica, inicio, fin, step="30s", chunk_days=5):
+def obtener_conexion_influx():
+    """Genera una conexión DBAPI de FlightSQL para InfluxDB 3."""
+    client = flightsql.FlightSQLClient(
+        host=INFLUX_HOST,
+        port=INFLUX_PORT,
+        insecure=True,
+        metadata={'database': INFLUX_DB, 'authorization': f'Bearer {INFLUX_TOKEN}'}
+    )
+    return flightsql.connect(client)
+
+def consultar_sensor_influxdb(tag_name, inicio, fin):
     """
-    Consulta una serie temporal desde la API query_range de Prometheus/VictoriaMetrics.
-    Realiza fragmentación (chunking) automática en rangos de `chunk_days` días para evitar
-    errores de límites de puntos por serie (HTTP 422) en consultas extensas.
+    Consulta una serie temporal (un tag) usando InfluxDB 3 (Flight SQL).
+    
+    Dependiendo de tu esquema real en InfluxDB, esta consulta puede variar:
+    - Si guardas columnas anchas: SELECT time, "{tag_name}" FROM "{INFLUX_MEASUREMENT}"
+    - Si usas Sparkplug B / Telegraf (esquema estrecho): SELECT time, value FROM "{INFLUX_MEASUREMENT}" WHERE name = '{tag_name}'
+    
+    Por defecto, asume el modelo relacional nativo de IOx (columnas anchas).
     """
-    query = f'lab_sat_valor{{equipo="{equipo}", metrica="{metrica}"}}'
-    url = f"{PROMETHEUS_URL}/api/v1/query_range"
-    nombre_columna = f"{equipo}_{metrica}"
+    print(f"  -> Consultando {tag_name} desde InfluxDB (FlightSQL)...")
     
-    print(f"  -> Consultando: {equipo}/{metrica} ...")
-    print(f"    Rango total: {inicio} -> {fin} (step={step})")
+    # IMPORTANTE: InfluxDB v3 SQL usa sintaxis PostgreSQL
+    # Convirtiendo fechas a strings compatibles (timestamp 'YYYY-MM-DD HH:MM:SS')
+    inicio_str = inicio.strftime('%Y-%m-%d %H:%M:%S')
+    fin_str = fin.strftime('%Y-%m-%d %H:%M:%S')
     
-    dfs_chunks = []
-    curr_inicio = inicio
-    delta_chunk = timedelta(days=chunk_days)
+    # Asumimos que la métrica o el nombre de la variable es una columna en el measurement
+    # Si devuelve error de columna inexistente, ajustar a la segunda forma comentada arriba.
+    query = f"""
+    SELECT 
+        time as "timestamp", 
+        "{tag_name}" as "{tag_name}"
+    FROM "{INFLUX_MEASUREMENT}"
+    WHERE time >= timestamp '{inicio_str}'
+      AND time <= timestamp '{fin_str}'
+      AND "{tag_name}" IS NOT NULL
+    ORDER BY time ASC
+    """
     
-    while curr_inicio < fin:
-        curr_fin = min(curr_inicio + delta_chunk, fin)
+    try:
+        conn = obtener_conexion_influx()
+        df = pd.read_sql_query(query, conn)
+        conn.close()
         
-        params = {
-            "query": query,
-            "start": int(curr_inicio.timestamp()),
-            "end":   int(curr_fin.timestamp()),
-            "step":  step,
-        }
-        
-        try:
-            response = requests.get(url, params=params, timeout=60)
-            response.raise_for_status()
-            data = response.json()
-            
-            if data.get("status") == "success":
-                results = data.get("data", {}).get("result", [])
-                if results:
-                    values = results[0].get("values", [])
-                    if values:
-                        df_sub = pd.DataFrame(values, columns=["timestamp", nombre_columna])
-                        df_sub["timestamp"] = pd.to_datetime(df_sub["timestamp"], unit="s", utc=True)
-                        df_sub[nombre_columna] = df_sub[nombre_columna].astype(float)
-                        dfs_chunks.append(df_sub)
-        except requests.exceptions.ConnectionError:
-            print(f"    [ERROR] No se pudo conectar a {PROMETHEUS_URL}")
+        if df.empty:
+            print(f"    [WARN] No se encontraron datos para {tag_name}")
             return pd.DataFrame()
-        except requests.exceptions.Timeout:
-            print(f"    [ERROR] Timeout al consultar {equipo}/{metrica} ({curr_inicio} a {curr_fin})")
-        except Exception as e:
-            print(f"    [WARN] Sub-consulta falló para {curr_inicio} -> {curr_fin}: {e}")
             
-        curr_inicio = curr_fin
+        # Asegurar formato correcto de timestamp
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        # Limpiar duplicados si los hay y ordenar
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
         
-    if not dfs_chunks:
-        print(f"    [WARN] No se encontraron datos para {equipo}/{metrica}")
+        print(f"    [OK] {len(df):,} muestras obtenidas. Rango: {df['timestamp'].min()} -> {df['timestamp'].max()}")
+        return df
+    except Exception as e:
+        print(f"    [ERROR] Falló la consulta a InfluxDB para {tag_name}: {e}")
+        # Hint para el usuario si es por esquema
+        if "column" in str(e).lower() and "does not exist" in str(e).lower():
+            print(f"    [!] Asegúrate de que '{INFLUX_MEASUREMENT}' es la tabla correcta y '{tag_name}' es una columna.")
         return pd.DataFrame()
-        
-    df_final = pd.concat(dfs_chunks).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    print(f"    [OK] {len(df_final):,} muestras obtenidas en total")
-    if not df_final.empty:
-        print(f"    Rango real: {df_final['timestamp'].min()} -> {df_final['timestamp'].max()}")
-        
-    return df_final
 
 
 # =============================================================================
-# FUNCIONES DE CARGA DE ARCHIVOS
+# FUNCIONES DE CARGA
 # =============================================================================
 
 def cargar_datos_csv(nombre_archivo="datos_sensores.csv"):
-    """
-    Carga el dataset de sensores desde un archivo CSV.
-    
-    El CSV debe tener una columna 'timestamp' y las columnas de features
-    definidas en COLUMNAS_FEATURES.
-    
-    Parámetros:
-    -----------
-    nombre_archivo : str
-        Nombre del archivo CSV dentro del directorio datos/
-        
-    Retorna:
-    --------
-    pd.DataFrame
-        DataFrame con timestamp como índice y las features como columnas.
-    """
     ruta = os.path.join(DATOS_DIR, nombre_archivo)
-    
     if not os.path.exists(ruta):
-        raise FileNotFoundError(
-            f"No se encontró el archivo: {ruta}\n"
-            f"Ejecuta primero '01_extraer_datos.py' para generar los datos."
-        )
-    
+        raise FileNotFoundError(f"No se encontró: {ruta}")
     df = pd.read_csv(ruta, parse_dates=["timestamp"], index_col="timestamp")
-    print(f"[OK] Datos cargados desde: {ruta}")
-    print(f"     Shape: {df.shape}")
-    print(f"     Rango: {df.index.min()} -> {df.index.max()}")
-    print(f"     Columnas: {list(df.columns)}")
-    
     return df
 
-
 def cargar_modelo(nombre_modelo="autoencoder_anomalias.keras"):
-    """
-    Carga un modelo Keras guardado en formato .keras
-    
-    Parámetros:
-    -----------
-    nombre_modelo : str
-        Nombre del archivo del modelo dentro del directorio modelos/
-        
-    Retorna:
-    --------
-    tensorflow.keras.Model
-        Modelo Keras cargado y listo para inferencia.
-    """
     from tensorflow import keras
-    
     ruta = os.path.join(MODELOS_DIR, nombre_modelo)
-    
     if not os.path.exists(ruta):
-        raise FileNotFoundError(
-            f"No se encontró el modelo: {ruta}\n"
-            f"Ejecuta primero '03_entrenar_autoencoder.py' para entrenar el modelo."
-        )
-    
-    modelo = keras.models.load_model(ruta)
-    print(f"[OK] Modelo cargado desde: {ruta}")
-    modelo.summary()
-    
-    return modelo
-
+        raise FileNotFoundError(f"No se encontró: {ruta}")
+    return keras.models.load_model(ruta)
 
 def cargar_scaler(nombre_archivo="scaler.joblib"):
-    """
-    Carga el scaler de normalización guardado con joblib.
-    
-    Parámetros:
-    -----------
-    nombre_archivo : str
-        Nombre del archivo del scaler dentro del directorio modelos/
-        
-    Retorna:
-    --------
-    sklearn.preprocessing.MinMaxScaler
-        Scaler ajustado, listo para transformar nuevos datos.
-    """
     ruta = os.path.join(MODELOS_DIR, nombre_archivo)
-    
     if not os.path.exists(ruta):
-        raise FileNotFoundError(
-            f"No se encontró el scaler: {ruta}\n"
-            f"Ejecuta primero '02_preprocesar_datos.py' para generar el scaler."
-        )
-    
-    scaler = joblib.load(ruta)
-    print(f"[OK] Scaler cargado desde: {ruta}")
-    
-    return scaler
-
+        raise FileNotFoundError(f"No se encontró: {ruta}")
+    return joblib.load(ruta)
 
 def cargar_umbral(nombre_archivo="umbral.joblib"):
-    """
-    Carga el umbral de anomalía guardado con joblib.
-    
-    Parámetros:
-    -----------
-    nombre_archivo : str
-        Nombre del archivo del umbral dentro del directorio modelos/
-        
-    Retorna:
-    --------
-    dict
-        Diccionario con claves 'p95', 'p99', 'mean', 'std'.
-    """
     ruta = os.path.join(MODELOS_DIR, nombre_archivo)
-    
     if not os.path.exists(ruta):
-        raise FileNotFoundError(
-            f"No se encontró el umbral: {ruta}\n"
-            f"Ejecuta primero '03_entrenar_autoencoder.py' para calcular el umbral."
-        )
-    
-    umbral = joblib.load(ruta)
-    print(f"[OK] Umbral cargado desde: {ruta}")
-    print(f"     Percentil 95: {umbral['p95']:.6f}")
-    print(f"     Percentil 99: {umbral['p99']:.6f}")
-    print(f"     Media:        {umbral['mean']:.6f}")
-    print(f"     Std:          {umbral['std']:.6f}")
-    
-    return umbral
-
-
-# =============================================================================
-# UTILIDADES DE VISUALIZACIÓN
-# =============================================================================
-
-def estilo_grafica():
-    """
-    Aplica un estilo consistente a las gráficas de matplotlib.
-    Debe llamarse antes de crear figuras.
-    """
-    import matplotlib.pyplot as plt
-    
-    plt.style.use("seaborn-v0_8-darkgrid")
-    plt.rcParams.update({
-        "figure.figsize": (14, 8),
-        "font.size": 11,
-        "axes.titlesize": 14,
-        "axes.labelsize": 12,
-        "lines.linewidth": 1.0,
-        "figure.dpi": 100,
-    })
-
+        raise FileNotFoundError(f"No se encontró: {ruta}")
+    return joblib.load(ruta)
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  UTILIDADES — Autoencoder Detector de Anomalías")
-    print("=" * 60)
-    print()
-    print(f"Prometheus URL: {PROMETHEUS_URL}")
-    print(f"Base Dir:       {BASE_DIR}")
-    print(f"Modelos Dir:    {MODELOS_DIR}")
-    print(f"Datos Dir:      {DATOS_DIR}")
-    print()
-    print("Sensores configurados:")
-    for nombre, config in SENSORES.items():
-        print(f"  {nombre:25s} -> tipo={config['tipo']}, "
-              f"nominal={config['nominal']}, var={config['variacion']}")
-    print()
+    print("Utilidades InfluxDB v3 FlightSQL")
     crear_directorios()
