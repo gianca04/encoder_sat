@@ -1,15 +1,30 @@
-# Entorno
+# Entornos Virtuales
+.venv/
+venv/
+env/
+
+# Variables de Entorno y Secretos
 .env
+.env.local
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 .pytest_cache/
 .ipynb_checkpoints/
 
-# Datos y Modelos (opcional, pero recomendado ignorar archivos grandes)
-# datos/*.csv
-# modelos/*.keras
-# modelos/*.joblib
+# Artefactos de MLOps (Modelos y Scalers)
+modelos/*.keras
+modelos/*.joblib
+modelos/backup/
+
+# Datos y Logs (No subir bases de datos ni logs generados localmente)
+datos/*.csv
+datos/*.json
+datos/*.log
+*.log
+
+# IDEs
+.vscode/
+.idea/

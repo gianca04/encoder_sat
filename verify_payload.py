@@ -73,9 +73,9 @@ def verificar():
                 errores += 1
 
     if errores == 0:
-        print(f"\n  ✅ Payload validado correctamente — {len(CAMPOS_REQUERIDOS_ROOT)} campos root + {len(CAMPOS_REQUERIDOS_SENSOR)} campos/sensor")
+        print(f"\n  Payload validado correctamente — {len(CAMPOS_REQUERIDOS_ROOT)} campos root + {len(CAMPOS_REQUERIDOS_SENSOR)} campos/sensor")
     else:
-        print(f"\n  ❌ {errores} campos faltantes")
+        print(f"\n  {errores} campos faltantes")
 
 if __name__ == "__main__":
     verificar()

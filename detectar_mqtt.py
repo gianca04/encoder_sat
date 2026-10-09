@@ -55,24 +55,21 @@ from utils import (
     MODELOS_DIR,
     DATOS_DIR,
 )
+from mqtt_publisher import HealthAssessmentPublisher
 
 # Configuración de Conexión MQTT
-MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.10.33")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.10.208")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_USER = os.getenv("MQTT_USER", "sat_lab")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "&HjVFmrhuBK")
+MQTT_TOPIC_PREFIX = os.getenv("MQTT_TOPIC_PREFIX", "edge/gateway")
+MQTT_TOPIC_SUB = os.getenv("MQTT_TOPIC_SUB", "sat_lab/telemetry/#")
+MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "sat_lab_backend_worker")
+MQTT_TOPIC_NOTIFICATIONS = os.getenv("MQTT_TOPIC_NOTIFICATIONS", "lab_sat/notifications")
+MQTT_TOPIC_METRICS = os.getenv("MQTT_TOPIC_METRICS", "lab_sat/metrics")
 
-# Mapping de Topics MQTT a Columnas de Features del Autoencoder
-TOPIC_MAP = {
-    "lab_sat/FIT_001/Flow":     "FIT_001_Flow",
-    "lab_sat/LIT_001/Level":    "LIT_001_Level",
-    "lab_sat/LIT_002/Level":    "LIT_002_Level",
-    "lab_sat/MOTOR_01/Running": "MOTOR_01_Running",
-    "lab_sat/TT_001/Temp":      "TT_001_Temp",
-    "lab_sat/TT_002/Temp":      "TT_002_Temp",
-}
-
-COLUMNA_TO_TOPIC = {v: k for k, v in TOPIC_MAP.items()}
+# Ya no usamos un TOPIC_MAP estático, extraeremos el tag_name, node_id y device_id dinámicamente
+# del topic MQTT: sat_lab/telemetry/${node_id}/${device_id}/${tag_name}
 
 # Constantes ISO 13374 AHI (se mantiene variable para no romper compatibilidad MQTT)
 ORDEN_NAMUR = {"OPTIMAL": 0, "ACCEPTABLE": 1, "DEGRADED": 2, "CRITICAL": 3}
@@ -82,24 +79,61 @@ NAMUR_INVERSO = {v: k for k, v in ORDEN_NAMUR.items()}
 STALE_TIMEOUT_S = 120
 
 
+def salud_desde_percentiles(valor, p95, p98, p99):
+    """
+    Mapea un error de reconstrucción a salud % anclada en percentiles de datos
+    normales de validación (regla 3.3 / NAMUR NE 107):
+        <= P95 -> 100..85  OPTIMAL            (Normal)
+        <= P98 -> 85..70   ACCEPTABLE         (Maintenance Required)
+        <= P99 -> 70..50   DEGRADED           (Out of Specification)
+        >  P99 -> 50..0    CRITICAL           (Failure)   (0% en 2xP99)
+    """
+    p95 = max(float(p95), 1e-12)
+    p98 = max(float(p98), p95)
+    p99 = max(float(p99), p98)
+    return float(np.interp(valor, [0.0, p95, p98, p99, 2.0 * p99], [100.0, 85.0, 70.0, 50.0, 0.0]))
+
+
+def estado_desde_salud(salud):
+    if salud >= 85.0:
+        return "OPTIMAL"
+    if salud >= 70.0:
+        return "ACCEPTABLE"
+    if salud >= 50.0:
+        return "DEGRADED"
+    return "CRITICAL"
+
+
+
 class DetectorAnomaliasMQTT:
     def __init__(self, umbral_tipo="p95", verbose=False, intervalo_eval=15):
         self.umbral_tipo = umbral_tipo
         self.verbose = verbose
         self.intervalo_eval = intervalo_eval
 
+        # Variables para Histéresis / Anti-Flapping (Regla 4.2)
+        self.historial_anomalias = []
+        self.VENTANA_M = 5
+        self.CONFIRMACIONES_N = 3
+        self.alarma_activa = False
+
         # Buffer multivariado inicializado en None
         self.buffer = OrderedDict()
         self.buffer_timestamps = OrderedDict()
+        self.topic_por_columna = {} # Para almacenar el último topic real y extraer node/device
         for col in COLUMNAS_FEATURES:
             self.buffer[col] = None
             self.buffer_timestamps[col] = None
+            self.topic_por_columna[col] = None
 
         self.ultima_eval = 0
         self.n_evaluaciones = 0
         self.n_anomalias = 0
         self.mensajes_recibidos = 0
         self.running = True
+
+        self.publisher = None
+        self.ultimo_estado_planta = None  # Almacenamiento ligero en memoria para cambios de estado
 
         self._cargar_artefactos()
         self.log_anomalias = []
@@ -134,23 +168,13 @@ class DetectorAnomaliasMQTT:
         print(f"  Umbral ({self.umbral_tipo}): {self.umbral_valor:.6f}")
         print(f"  Columnas cargadas: {self.columnas}")
 
-    def _evaluar(self):
-        ahora = time.time()
-
-        # Respetar frecuencia de evaluación mínima
-        if ahora - self.ultima_eval < self.intervalo_eval:
-            return
-
-        # Comprobar que el buffer cuente con lecturas completas
-        faltantes = [k for k, v in self.buffer.items() if v is None]
-        if faltantes:
-            if self.verbose:
-                print(f"  [WAIT] Esperando datos de sensores: {faltantes}")
-            return
-
-        self.ultima_eval = ahora
-        self.n_evaluaciones += 1
-
+    def evaluar_muestra(self):
+        """
+        Núcleo puro de inferencia (sin efectos MQTT): toma el buffer multivariado
+        actual, normaliza, reconstruye y calcula salud por sensor y de la planta
+        (ISO 13374 State Detection -> Health Assessment / NAMUR NE107).
+        Es el método que ejercita test_salud_planta.py.
+        """
         # Construir muestra alineada
         valores = np.array([[self.buffer[col] for col in self.columnas]])
 
@@ -178,10 +202,11 @@ class DetectorAnomaliasMQTT:
         ahora_ts = time.time()
         
         for i, col in enumerate(self.columnas):
-            topic_orig = COLUMNA_TO_TOPIC.get(col, "")
-            parts_orig = topic_orig.split("/") if topic_orig else []
-            eq_id = parts_orig[1] if len(parts_orig) > 1 else col
-            met_name = parts_orig[2] if len(parts_orig) > 2 else "Valor"
+            topic_real = self.topic_por_columna.get(col)
+            # Extrayendo info del topic sat_lab/telemetry/{node_id}/{device_id}/{tag_name}
+            parts_orig = topic_real.split("/") if topic_real else []
+            eq_id = parts_orig[-2] if len(parts_orig) >= 2 else col
+            node_id = parts_orig[-3] if len(parts_orig) >= 3 else "unknown"
 
             # Metadata del sensor desde la configuración central
             sensor_cfg = SENSORES.get(col, {})
@@ -198,40 +223,27 @@ class DetectorAnomaliasMQTT:
                 quality = "GOOD"
                 ts_dato_iso = datetime.fromtimestamp(ts_dato, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
-            # ── SALUD POR SENSOR: NAMUR NE107 con Z-Score Individual ──
-            if self.stats_por_sensor and col in self.stats_por_sensor:
-                stats = self.stats_por_sensor[col]
-                sensor_mean = stats["mean"]
-                sensor_std = stats["std"] if stats["std"] > 1e-10 else 1e-10
-                sensor_p95 = stats["p95"]
-                sensor_p99 = stats["p99"]
-
-                z_score = (errores_features[i] - sensor_mean) / sensor_std
-                salud_sensor = float(max(0.0, min(100.0, 100.0 * (1.0 - z_score / 6.0))))
-
-                if salud_sensor >= 85.0:
-                    estado_sensor = "OPTIMAL"
-                elif salud_sensor >= 70.0:
-                    estado_sensor = "ACCEPTABLE"
-                elif salud_sensor >= 50.0:
-                    estado_sensor = "DEGRADED"
-                else:
-                    estado_sensor = "CRITICAL"
-
-                # Anomalía INDIVIDUAL basada en umbral propio del sensor
-                es_sensor_anomalo = bool(errores_features[i] > sensor_p95)
+            # ── SALUD POR SENSOR: bandas P95/P98/P99 propias (NAMUR NE107, regla 3.3) ──
+            stats = (self.stats_por_sensor or {}).get(col)
+            if stats:
+                p95s, p99s = stats["p95"], stats["p99"]
+                p98s = stats.get("p98", (p95s + p99s) / 2.0)
             else:
-                salud_sensor = float(100.0 * (1.0 - (errores_features[i] / (self.umbral_valor * 5.0))))
-                salud_sensor = max(0.0, min(100.0, salud_sensor))
-                estado_sensor = "OPTIMAL" if salud_sensor >= 85.0 else ("ACCEPTABLE" if salud_sensor >= 70.0 else ("DEGRADED" if salud_sensor >= 50.0 else "CRITICAL"))
-                es_sensor_anomalo = bool(errores_features[i] > self.umbral_valor)
+                p95s, p99s = self.umbral_info["p95"], self.umbral_info["p99"]
+                p98s = self.umbral_info.get("p98", (p95s + p99s) / 2.0)
+
+            salud_sensor = salud_desde_percentiles(errores_features[i], p95s, p98s, p99s)
+            estado_sensor = estado_desde_salud(salud_sensor)
+            # Anomalía INDIVIDUAL basada en umbral propio del sensor
+            es_sensor_anomalo = bool(errores_features[i] > p95s)
 
             valor_actual = float(self.buffer[col])
             valor_esperado = float(reconstruido_raw[i])
 
             lista_sensores.append({
-                "equipo_id": eq_id,
-                "metrica": met_name,
+                "node_id": node_id,
+                "device_id": eq_id,
+                "tag_name": col,
                 "unidad": sensor_cfg.get("unidad", ""),
                 "tipo_dato": sensor_cfg.get("tipo", "REAL"),
                 "valor_actual": round(valor_actual, 4),
@@ -247,59 +259,174 @@ class DetectorAnomaliasMQTT:
                 "timestamp_dato": ts_dato_iso,
             })
 
-        # ── ESTADO GENERAL DE PLANTA (Principio del eslabón más débil) ──
-        salud_planta = min(sensor["salud_pct"] for sensor in lista_sensores)
-        peor_estado_idx = max(ORDEN_NAMUR.get(sensor["estado_namur"], 0) for sensor in lista_sensores)
-        estado_planta = NAMUR_INVERSO[peor_estado_idx]
+        # ── ESTADO GENERAL DE PLANTA (ISO 13374: sobre el residuo GLOBAL) ──
+        # El mínimo de N sensores se degrada por azar al crecer N (falsos positivos);
+        # el estado de planta se evalúa sobre el MSE global contra sus percentiles
+        # de validación. El detalle por sensor queda para el diagnóstico de causa raíz.
+        p95g = self.umbral_info["p95"]
+        p99g = self.umbral_info["p99"]
+        p98g = self.umbral_info.get("p98", (p95g + p99g) / 2.0)
+        salud_planta = salud_desde_percentiles(mse_total, p95g, p98g, p99g)
+        estado_planta = estado_desde_salud(salud_planta)
+        peor_estado_idx = ORDEN_NAMUR[estado_planta]
         n_sensores_degradados = sum(1 for sensor in lista_sensores if sensor["estado_namur"] != "OPTIMAL")
 
-        # ── PUBLICAR MÉTRICAS ML EN TOPIC ESTRUCTURADO (CADA EVALUACIÓN) ──
-        topic_metricas = "lab_sat/autoencoder/metricas"
-        payload_metricas = json.dumps({
-            "schema_version": "2.0",
-            "timestamp": ts,
-            "modelo": {
-                "id": "autoencoder_anomalias",
-                "umbral_tipo": self.umbral_tipo,
-                "umbral_valor": round(float(self.umbral_valor), 6),
-            },
-            "planta": {
-                "salud_pct": round(salud_planta, 2),
-                "estado_namur": estado_planta,
-                "estado_code": peor_estado_idx,
-                "sensores_degradados": n_sensores_degradados,
-                "sensores_total": len(lista_sensores),
-                "mse": round(float(mse_total), 6),
-                "desviacion_ratio": round(desviacion_ratio, 4),
-            },
-            "sensores": lista_sensores,
-        }, ensure_ascii=False)
+        return {
+            "ts": ts,
+            "es_anomalia": bool(es_anomalia),
+            "mse_total": float(mse_total),
+            "desviacion_ratio": desviacion_ratio,
+            "errores_features": errores_features,
+            "reconstruido_raw": reconstruido_raw,
+            "idx_peor": int(idx_peor),
+            "peor_sensor": peor_sensor,
+            "lista_sensores": lista_sensores,
+            "salud_planta": salud_planta,
+            "peor_estado_idx": peor_estado_idx,
+            "estado_planta": estado_planta,
+            "n_sensores_degradados": n_sensores_degradados,
+        }
 
+    def _evaluar(self):
+        ahora = time.time()
+
+        # Respetar frecuencia de evaluación mínima
+        if ahora - self.ultima_eval < self.intervalo_eval:
+            return
+
+        # Comprobar que el buffer cuente con lecturas completas
+        faltantes = [k for k, v in self.buffer.items() if v is None]
+        if faltantes:
+            if self.verbose:
+                print(f"  [WAIT] Esperando datos de sensores: {faltantes}")
+            return
+
+        # ── REGLA OT 1.1: MÁSCARA DE ESTADO OPERATIVO (Golden Baseline) ──
+        # Solo evaluamos si el PLC indica que el compresor DEBERÍA estar encendido.
+        if "Mot_Comp_001" in self.buffer and self.buffer["Mot_Comp_001"] < 0.5:
+            if self.alarma_activa:
+                print(f"\n  [INFO] Máquina apagada por comando (Mot_Comp_001=0). Reseteando alarmas.")
+                self.alarma_activa = False
+                self.historial_anomalias.clear()
+            
+            if self.verbose:
+                print(f"  [{time.strftime('%H:%M:%S')}] Planta detenida (Mot_Comp_001=0). Evaluaciones suspendidas.")
+            
+            # Publicar estado IDLE para limpiar el Dashboard en Grafana
+            try:
+                if hasattr(self, "client") and self.client and self.publisher:
+                    # 1. IDLE global
+                    self.publisher.publish_metrics(
+                        node_id="plc_siemens_lab",
+                        device_id="global_plant",
+                        health_score_percent=100.0,
+                        namur_status="IDLE",
+                        mse_raw=0.0,
+                        umbral_p95=self.umbral_info.get("p95", 0)
+                    )
+                    
+                    # 2. IDLE individual para cada sensor almacenado
+                    for col in self.columnas:
+                        topic_real = self.topic_por_columna.get(col)
+                        parts = topic_real.split("/") if topic_real else []
+                        d_id = parts[-2] if len(parts) >= 2 else "unknown_device"
+                        n_id = parts[-3] if len(parts) >= 3 else "unknown_node"
+                        
+                        p95_sensor = self.umbral_info.get("p95", 0)
+                        if self.stats_por_sensor and col in self.stats_por_sensor:
+                            p95_sensor = self.stats_por_sensor[col].get("p95", p95_sensor)
+                            
+                        self.publisher.publish_metrics(
+                            node_id=n_id,
+                            device_id=d_id,
+                            health_score_percent=100.0,
+                            namur_status="IDLE",
+                            mse_raw=0.0,
+                            umbral_p95=p95_sensor
+                        )
+                    if self.verbose:
+                        print(f"    [MQTT] Estado publicado: IDLE (Planta apagada) global y por sensor")
+            except Exception as e:
+                print(f"    [WARN] Excepción al enviar payload IDLE: {e}")
+
+            self.ultima_eval = ahora
+            return
+
+        self.ultima_eval = ahora
+        self.n_evaluaciones += 1
+
+        r = self.evaluar_muestra()
+        ts = r["ts"]
+        es_anomalia = r["es_anomalia"]
+        mse_total = r["mse_total"]
+        desviacion_ratio = r["desviacion_ratio"]
+        errores_features = r["errores_features"]
+        reconstruido_raw = r["reconstruido_raw"]
+        idx_peor = r["idx_peor"]
+        peor_sensor = r["peor_sensor"]
+        lista_sensores = r["lista_sensores"]
+        salud_planta = r["salud_planta"]
+        peor_estado_idx = r["peor_estado_idx"]
+        estado_planta = r["estado_planta"]
+        n_sensores_degradados = r["n_sensores_degradados"]
+
+        # ── PUBLICAR MÉTRICAS CONTINUAS ──
         try:
-            if hasattr(self, "client") and self.client:
-                self.client.publish(topic_metricas, payload_metricas, qos=1)
-                if self.verbose:
-                    print(f"    [MQTT] Métricas ML publicadas en: {topic_metricas}")
-                    print(f"    [MQTT] Planta: salud={salud_planta:.1f}% estado={estado_planta} degradados={n_sensores_degradados}/{len(lista_sensores)}")
-        except Exception as e:
-            print(f"    [WARN] No se pudo publicar métricas ML: {e}")
+            if hasattr(self, "client") and self.client and self.publisher:
+                # 1. Publicar estado general de la planta
+                self.publisher.publish_metrics(
+                    node_id="plc_siemens_lab",
+                    device_id="global_plant",
+                    health_score_percent=salud_planta,
+                    namur_status=estado_planta,
+                    mse_raw=mse_total,
+                    umbral_p95=self.umbral_info["p95"]
+                )
 
-        # ── BLOQUE DE ANOMALÍA: SOLO LOGGING Y CONSOLA ──
-        if es_anomalia:
+                # 2. Publicar métricas individuales de cada sensor (Root Cause Analysis)
+                for sensor in lista_sensores:
+                    # Encontrar el umbral p95 específico de este sensor si existe
+                    p95_sensor = self.umbral_info["p95"]
+                    if self.stats_por_sensor and sensor["tag_name"] in self.stats_por_sensor:
+                        p95_sensor = self.stats_por_sensor[sensor["tag_name"]].get("p95", p95_sensor)
+
+                    self.publisher.publish_metrics(
+                        node_id=sensor["node_id"],
+                        device_id=sensor["device_id"],
+                        health_score_percent=sensor["salud_pct"],
+                        namur_status=sensor["estado_namur"],
+                        mse_raw=sensor["error_reconstruccion"],
+                        umbral_p95=p95_sensor
+                    )
+                
+                if self.verbose:
+                    print(f"    [MQTT] Predicción publicada: salud={salud_planta:.1f}% estado={estado_planta}")
+        except Exception as e:
+            print(f"    [WARN] Excepción al enviar payload de métricas: {e}")
+
+        # ── LÓGICA DE HISTÉRESIS / ANTI-FLAPPING (Regla 4.2) ──
+        self.historial_anomalias.append(es_anomalia)
+        if len(self.historial_anomalias) > self.VENTANA_M:
+            self.historial_anomalias.pop(0)
+
+        es_anomalia_confirmada = sum(self.historial_anomalias) >= self.CONFIRMACIONES_N
+
+        if es_anomalia_confirmada and not self.alarma_activa:
             self.n_anomalias += 1
+            self.alarma_activa = True
 
             # Extraer info del sensor crítico para la consola
-            topic_original = COLUMNA_TO_TOPIC.get(peor_sensor)
-            parts = topic_original.split("/") if topic_original else []
-            equipo_id = parts[1] if len(parts) > 1 else peor_sensor
-            metrica_name = parts[2] if len(parts) > 2 else "Valor"
+            topic_real = self.topic_por_columna.get(peor_sensor)
+            parts = topic_real.split("/") if topic_real else []
+            device_id = parts[-2] if len(parts) >= 2 else peor_sensor
+            node_id = parts[-3] if len(parts) >= 3 else "unknown"
 
             print(f"\n  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             print(f"  !! ALERTA: ANOMALÍA DETECTADA EN SENSADO  #{self.n_anomalias}")
             print(f"  !! Timestamp:        {ts}")
             print(f"  !! MSE Muestra:      {mse_total:.6f} (Umbral: {self.umbral_valor:.6f})")
             print(f"  !! Desviación:       {desviacion_ratio:.1f}x sobre el límite")
-            print(f"  !! Sensor Crítico:   {peor_sensor} (Equipo: {equipo_id} | Métrica: {metrica_name})")
+            print(f"  !! Sensor Crítico:   {peor_sensor} (Nodo: {node_id} | Dispositivo: {device_id})")
             print(f"  !!   Valor Actual:   {self.buffer[peor_sensor]:.4f}")
             print(f"  !!   Valor Esperado: {reconstruido_raw[idx_peor]:.4f}")
             print(f"  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -312,35 +439,64 @@ class DetectorAnomaliasMQTT:
             self.log_anomalias.append({
                 "timestamp": ts,
                 "mse_total": float(mse_total),
-                "equipo_id": equipo_id,
-                "metrica_name": metrica_name,
+                "device_id": device_id,
+                "tag_name": peor_sensor,
                 "valores": dict(self.buffer),
                 "errores": {col: float(errores_features[idx]) for idx, col in enumerate(self.columnas)},
             })
-        else:
+            
+            try:
+                if hasattr(self, "client") and self.client and self.publisher:
+                    sensores_ordenados = sorted(lista_sensores, key=lambda x: x['error_reconstruccion'], reverse=True)
+                    root_cause = [{"sensor": s["tag_name"], "deviation_score": s["error_reconstruccion"]} for s in sensores_ordenados[:3]]
+                    
+                    self.publisher.publish_alert(
+                        node_id=node_id,
+                        device_id=device_id,
+                        health_score_percent=salud_planta,
+                        namur_status=estado_planta,
+                        mse_raw=mse_total,
+                        umbral_p95=self.umbral_info["p95"],
+                        root_cause_top=root_cause
+                    )
+                    print(f"  [MQTT] Alerta extrema enviada a: {MQTT_TOPIC_NOTIFICATIONS}")
+            except Exception as e:
+                print(f"  [WARN] Excepción al enviar alerta: {e}")
+
+        elif not es_anomalia_confirmada:
+            # Si bajamos del umbral, se resetea la alarma
+            if self.alarma_activa:
+                print(f"\n  [INFO] Planta volvió a estado estable. Alarma desactivada.")
+                self.alarma_activa = False
+                
             if self.verbose:
                 print(f"  [{ts}] Lectura normal - MSE={mse_total:.6f} ({mse_total/self.umbral_valor*100:.0f}% del umbral)")
             else:
                 if self.n_evaluaciones % 10 == 0:
                     print(f"  [{ts}] Operación normal | Eval #{self.n_evaluaciones} | Anomalías: {self.n_anomalias}")
 
-    # callbacks MQTT
-    def on_connect(self, client, userdata, flags, rc, properties=None):
+    def on_connect(self, client, userdata, flags, *args):
+        rc = args[0] if args else 0
         if rc == 0:
             print(f"\n  [OK] Conexión establecida con broker MQTT: {MQTT_BROKER}:{MQTT_PORT}")
-            print(f"  Suscribiéndose a topics de sensores...")
-            for topic, col in TOPIC_MAP.items():
-                client.subscribe(topic, qos=1)
-                print(f"    -> {topic} ({col})")
+            
+            # Inicializar el publicador con el cliente
+            self.publisher = HealthAssessmentPublisher(client, MQTT_TOPIC_NOTIFICATIONS, MQTT_TOPIC_METRICS)
+
+            print(f"  Suscribiéndose a topic principal: {MQTT_TOPIC_SUB}")
+            client.subscribe(MQTT_TOPIC_SUB, qos=1)
             # Publicar estado ONLINE (sobrescribe el LWT OFFLINE)
-            client.publish("lab_sat/autoencoder/status",
+            topic_status = f"{MQTT_TOPIC_PREFIX}/autoencoder/status"
+            client.publish(topic_status,
                 json.dumps({"status": "ONLINE", "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")}),
                 qos=1, retain=True)
             print(f"\n  [OK] Escuchando lecturas industriales...")
         else:
             print(f"  [ERROR] Fallo de autenticación o conexión MQTT. Código: {rc}")
 
-    def on_disconnect(self, client, userdata, rc, properties=None):
+    def on_disconnect(self, client, userdata, *args):
+        # Maneja diferentes firmas según la versión de paho-mqtt
+        rc = args[1] if len(args) >= 2 else (args[0] if args else 0)
         if rc != 0:
             print(f"  [WARN] Desconexión imprevista de MQTT. Reconectando...")
         else:
@@ -364,17 +520,25 @@ class DetectorAnomaliasMQTT:
         except Exception:
             return
 
-        columna = TOPIC_MAP.get(topic)
-        if columna is None:
-            # Tolerancia a prefijos en topics
-            for t, c in TOPIC_MAP.items():
-                if topic.endswith(t.split("/", 1)[-1] if "/" in t else t):
-                    columna = c
-                    break
+        # Dependiendo de la estructura del topic, el tag (ej. PIT_001) puede estar al final
+        # o penúltimo si tiene un sufijo de propiedad (ej. /PIT_001/Pressure)
+        partes = topic.split("/")
+        sensor_candidato_1 = partes[-1]
+        sensor_candidato_2 = partes[-2] if len(partes) > 1 else ""
+        
+        columna = None
+        if sensor_candidato_1 in COLUMNAS_FEATURES:
+            columna = sensor_candidato_1
+        elif sensor_candidato_2 in COLUMNAS_FEATURES:
+            columna = sensor_candidato_2
+        else:
+            if self.mensajes_recibidos <= 5 and self.verbose:
+                print(f"  [DEBUG] Topic ignorado: {topic} (Buscando {sensor_candidato_1} o {sensor_candidato_2})")
 
         if columna is not None:
             self.buffer[columna] = valor
             self.buffer_timestamps[columna] = time.time()
+            self.topic_por_columna[columna] = topic
             if self.verbose:
                 print(f"  [LECTURA] {columna} = {valor:.4f}")
             self._evaluar()
@@ -382,14 +546,13 @@ class DetectorAnomaliasMQTT:
     def iniciar(self):
         import platform
 
-        client_id = f"autoencoder_{platform.node()}_{os.getpid()}"
         try:
             client = mqtt.Client(
                 callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-                client_id=client_id
+                client_id=MQTT_CLIENT_ID
             )
         except AttributeError:
-            client = mqtt.Client(client_id=client_id)
+            client = mqtt.Client(client_id=MQTT_CLIENT_ID)
 
         self.client = client
         client.username_pw_set(MQTT_USER, MQTT_PASSWORD)

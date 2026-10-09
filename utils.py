@@ -18,7 +18,7 @@ import joblib
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-import flightsql
+
 
 # Forzar UTF-8 en la consola de Windows (evita errores cp1252)
 if sys.stdout.encoding != 'utf-8':
@@ -32,7 +32,7 @@ if sys.stderr.encoding != 'utf-8':
 # =============================================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 INFLUX_HOST = os.getenv("INFLUXDB_HOST", "192.168.10.145")
 INFLUX_PORT = int(os.getenv("INFLUXDB_PORT", "8182"))
@@ -46,22 +46,22 @@ DATOS_DIR = os.path.join(BASE_DIR, "datos")
 # Definición de los nuevos sensores a monitorear
 # Ahora todos forman parte de la consulta SQL como columnas/tags
 SENSORES = {
-    "PIT_001":               {"tipo": "REAL", "unidad": "PSI"},
-    "FIT_001_MAS":           {"tipo": "REAL", "unidad": "kg/s"},
-    "FIT_001_DENS":          {"tipo": "REAL", "unidad": "kg/m3"},
-    "FIT_001_TEMP":          {"tipo": "REAL", "unidad": "°C"},
-    "FIT_001_VOL":           {"tipo": "REAL", "unidad": "m3/s"},
-    "LIT_001":               {"tipo": "REAL", "unidad": "%"},
-    "LIT_002":               {"tipo": "REAL", "unidad": "%"},
-    "TT_001":                {"tipo": "REAL", "unidad": "°C"},
-    "Bomba_Agua_001_STATUS": {"tipo": "BOOL", "unidad": "Estado"},
-    "Bomba_Agua_001_REF":    {"tipo": "REAL", "unidad": "RPM"},
-    "Val_001":               {"tipo": "BOOL", "unidad": "Estado"},
-    "Val_002":               {"tipo": "BOOL", "unidad": "Estado"},
-    "Val_003":               {"tipo": "BOOL", "unidad": "Estado"},
-    "Val_004":               {"tipo": "BOOL", "unidad": "Estado"},
-    "Mot_Comp_001":          {"tipo": "BOOL", "unidad": "Estado"},
-    "MOTOR_01":              {"tipo": "BOOL", "unidad": "Estado"},
+    "PIT_001":               {"tipo": "REAL", "unidad": "PSI", "influx_col": "PIT_001/Pressure"},
+    "FIT_001_MAS":           {"tipo": "REAL", "unidad": "kg/s", "influx_col": "FIT_001_MAS/Mass_Flow"},
+    "FIT_001_DENS":          {"tipo": "REAL", "unidad": "kg/m3", "influx_col": "FIT_001_DENS/Density"},
+    "FIT_001_TEMP":          {"tipo": "REAL", "unidad": "°C", "influx_col": "FIT_001_TEMP/Temperature"},
+    "FIT_001_VOL":           {"tipo": "REAL", "unidad": "m3/s", "influx_col": "FIT_001_VOL/Volumetric_Flow"},
+    "LIT_001":               {"tipo": "REAL", "unidad": "%", "influx_col": "LIT_001/Level"},
+    "LIT_002":               {"tipo": "REAL", "unidad": "%", "influx_col": "LIT_002/Level"},
+    "TT_001":                {"tipo": "REAL", "unidad": "°C", "influx_col": "TT_001/Temp"},
+    "Bomba_Agua_001_STATUS": {"tipo": "BOOL", "unidad": "Estado", "influx_col": "Bomba_Agua_001_STATUS/State"},
+    "Bomba_Agua_001_REF":    {"tipo": "REAL", "unidad": "RPM", "influx_col": "Bomba_Agua_001_REF/Speed_Ref"},
+    "Val_001":               {"tipo": "BOOL", "unidad": "Estado", "influx_col": "Val_001/State"},
+    "Val_002":               {"tipo": "BOOL", "unidad": "Estado", "influx_col": "Val_002/State"},
+    "Val_003":               {"tipo": "BOOL", "unidad": "Estado", "influx_col": "Val_003/State"},
+    "Val_004":               {"tipo": "BOOL", "unidad": "Estado", "influx_col": "Val_004/State"},
+    "Mot_Comp_001":          {"tipo": "BOOL", "unidad": "Estado", "influx_col": "Mot_Comp_001/State"},
+    "MOTOR_01":              {"tipo": "BOOL", "unidad": "Estado", "influx_col": "MOTOR_01/Running"},
 }
 
 COLUMNAS_FEATURES = list(SENSORES.keys())
@@ -78,25 +78,11 @@ def crear_directorios():
 # CONSULTA A INFLUXDB v3 (Flight SQL)
 # =============================================================================
 
-def obtener_conexion_influx():
-    """Genera una conexión DBAPI de FlightSQL para InfluxDB 3."""
-    client = flightsql.FlightSQLClient(
-        host=INFLUX_HOST,
-        port=INFLUX_PORT,
-        insecure=True,
-        metadata={'database': INFLUX_DB, 'authorization': f'Bearer {INFLUX_TOKEN}'}
-    )
-    return flightsql.connect(client)
+from influxdb_client_3 import InfluxDBClient3
 
 def consultar_sensor_influxdb(tag_name, inicio, fin):
     """
-    Consulta una serie temporal (un tag) usando InfluxDB 3 (Flight SQL).
-    
-    Dependiendo de tu esquema real en InfluxDB, esta consulta puede variar:
-    - Si guardas columnas anchas: SELECT time, "{tag_name}" FROM "{INFLUX_MEASUREMENT}"
-    - Si usas Sparkplug B / Telegraf (esquema estrecho): SELECT time, value FROM "{INFLUX_MEASUREMENT}" WHERE name = '{tag_name}'
-    
-    Por defecto, asume el modelo relacional nativo de IOx (columnas anchas).
+    Consulta una serie temporal (un tag) usando InfluxDB 3 (Flight SQL) via influxdb_client_3.
     """
     print(f"  -> Consultando {tag_name} desde InfluxDB (FlightSQL)...")
     
@@ -107,21 +93,22 @@ def consultar_sensor_influxdb(tag_name, inicio, fin):
     
     # Asumimos que la métrica o el nombre de la variable es una columna en el measurement
     # Si devuelve error de columna inexistente, ajustar a la segunda forma comentada arriba.
+    influx_col = SENSORES.get(tag_name, {}).get("influx_col", tag_name)
     query = f"""
     SELECT 
         time as "timestamp", 
-        "{tag_name}" as "{tag_name}"
+        "{influx_col}" as "{tag_name}"
     FROM "{INFLUX_MEASUREMENT}"
     WHERE time >= timestamp '{inicio_str}'
       AND time <= timestamp '{fin_str}'
-      AND "{tag_name}" IS NOT NULL
+      AND "{influx_col}" IS NOT NULL
     ORDER BY time ASC
     """
     
     try:
-        conn = obtener_conexion_influx()
-        df = pd.read_sql_query(query, conn)
-        conn.close()
+        client = InfluxDBClient3(host=f"grpc://{INFLUX_HOST}:{INFLUX_PORT}", token=INFLUX_TOKEN, database=INFLUX_DB)
+        table = client.query(query=query, language="sql")
+        df = table.to_pandas()
         
         if df.empty:
             print(f"    [WARN] No se encontraron datos para {tag_name}")

@@ -238,13 +238,21 @@ def preprocesar_datos(df_crudo, max_gap_segundos=180):
 
     df_consolidado = pd.concat(dfs_limpios)
 
-    # Filtrar si la máquina estuvo apagada
-    if "Bomba_Agua_001_STATUS" in df_consolidado.columns and "Mot_Comp_001" in df_consolidado.columns:
+    # Filtrar estado nominal (Golden Baseline: Motor encendido, Presión óptima y Niveles aceptables)
+    if "Mot_Comp_001" in df_consolidado.columns and "PIT_001" in df_consolidado.columns and "LIT_001" in df_consolidado.columns and "LIT_002" in df_consolidado.columns:
         n_prev = len(df_consolidado)
-        mask = (df_consolidado["Bomba_Agua_001_STATUS"] == 1) | (df_consolidado["Mot_Comp_001"] == 1)
+        mask = (
+            (df_consolidado["Mot_Comp_001"] >= 0.5) & 
+            (df_consolidado["PIT_001"] >= 2.0) & 
+            (df_consolidado["LIT_001"] > 10.0) & 
+            (df_consolidado["LIT_002"] > 12.0)
+        )
         df_consolidado = df_consolidado[mask]
-        print(f"  [INFO] Filtrado por operación (Bomba_Agua_001_STATUS==1 o Mot_Comp_001==1): {len(df_consolidado):,} de {n_prev:,} muestras conservadas.")
+        print(f"  [INFO] Golden Baseline aplicado (Motor=1, PIT>=2, LIT_001>10, LIT_002>12): {len(df_consolidado):,} de {n_prev:,} muestras conservadas.")
 
+    # Filtrar valores basura extremos (PLC garbage bits) que causan NaN en Keras
+    df_consolidado = df_consolidado.clip(lower=-1e6, upper=1e6)
+    
     df = df_consolidado.dropna()
     n_muestras = len(df)
 
@@ -364,19 +372,24 @@ def entrenar_modelo(df_train_norm, df_test_norm, epochs=200, batch_size=64):
     return autoencoder, history, val_loss_final
 
 
-def calcular_umbral(autoencoder, df_train_norm):
-    """Calcula umbrales globales y estadísticas de error por sensor individual."""
+def calcular_umbral(autoencoder, df_val_norm):
+    """
+    Calcula umbrales globales y estadísticas de error por sensor individual.
+    Regla 3.1: se calculan sobre residuos de datos normales de VALIDACIÓN
+    (no vistos en el ajuste de pesos); los residuos de train están sesgados a la baja.
+    """
     print("\n" + "=" * 60)
-    print("  PASO 5: Cálculo del nuevo umbral de anomalía")
+    print("  PASO 5: Cálculo del nuevo umbral de anomalía (sobre validación)")
     print("=" * 60)
     
-    X_train = df_train_norm.values.astype(np.float32)
+    X_train = df_val_norm.values.astype(np.float32)
     X_reconstructed = autoencoder.predict(X_train, verbose=0)
     
     # ── UMBRAL GLOBAL (MSE promedio de todos los sensores por muestra) ──
     mse = np.mean(np.square(X_train - X_reconstructed), axis=1)
     
     p95 = float(np.percentile(mse, 95))
+    p98 = float(np.percentile(mse, 98))
     p99 = float(np.percentile(mse, 99))
     mean = float(np.mean(mse))
     std = float(np.std(mse))
@@ -389,7 +402,7 @@ def calcular_umbral(autoencoder, df_train_norm):
     # Cada sensor tiene su propia distribución de error de reconstrucción
     # Esto permite calcular salud relativa a su propio comportamiento histórico
     errores_por_sensor = np.square(X_train - X_reconstructed)  # shape: (n_muestras, n_features)
-    columnas = list(df_train_norm.columns)
+    columnas = list(df_val_norm.columns)
     
     stats_por_sensor = {}
     print(f"\n    Estadísticas por sensor (error de reconstrucción):")
@@ -402,6 +415,7 @@ def calcular_umbral(autoencoder, df_train_norm):
             "mean": float(np.mean(errores_col)),
             "std": float(np.std(errores_col)),
             "p95": float(np.percentile(errores_col, 95)),
+            "p98": float(np.percentile(errores_col, 98)),
             "p99": float(np.percentile(errores_col, 99)),
         }
         stats_por_sensor[col] = stats
@@ -409,6 +423,7 @@ def calcular_umbral(autoencoder, df_train_norm):
     
     return {
         "p95": p95,
+        "p98": p98,
         "p99": p99,
         "mean": mean,
         "std": std,
@@ -469,7 +484,7 @@ def main():
             df_train_norm, df_test_norm, epochs=args.epochs, batch_size=args.batch_size
         )
         
-        umbral_info = calcular_umbral(autoencoder, df_train_norm)
+        umbral_info = calcular_umbral(autoencoder, df_test_norm)
         
         metadata = {
             "n_features": len(COLUMNAS_FEATURES),

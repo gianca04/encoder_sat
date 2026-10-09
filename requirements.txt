@@ -13,3 +13,4 @@ requests>=2.31.0
 # Plotting & Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
+influxdb3-python>=0.2.0
